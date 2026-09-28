@@ -3,7 +3,7 @@ name = "cw-chat"
 version = "0.1.0"
 edition = "2024"
 description = "PipeWire-native CW chat: Morse transmit and receive"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 pipewire = { version = "0.10", features = ["v0_3_49"] }

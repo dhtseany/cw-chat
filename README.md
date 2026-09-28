@@ -148,3 +148,17 @@ Validated in development: 15 unit tests, formatting, and Clippy pass; both scrip
 pass; both GUI copies start, link, and stay up under a headless compositor. The
 window has not yet been exercised by hand, and physical-device and on-air use have
 not been auditioned.
+
+## License
+
+Copyright (C) 2026 Sean Snell
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+See [LICENSE](LICENSE) for the full text.
