@@ -1,0 +1,14 @@
+[package]
+name = "cw-chat"
+version = "0.1.0"
+edition = "2024"
+description = "PipeWire-native CW chat: Morse transmit and receive"
+license = "MIT"
+
+[dependencies]
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_5"] }
+async-channel = "2"
