@@ -1,2 +1,4 @@
 /target/
 *.wav
+# Local session handoff notes; not published
+primer.md
