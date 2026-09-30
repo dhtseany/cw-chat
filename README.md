@@ -17,6 +17,11 @@ makepkg -si
 It installs `/usr/bin/cw-chat` and a "CW Chat" launcher entry. The package builds a
 tagged release from GitHub and runs the test suite first.
 
+The launcher icon is a white Morse key on a teal-blue background. The source image is
+`assets/icons/net.cwchat.CwChat.png`, with 16–512 px sizes beside it; the package
+installs those to `/usr/share/icons/hicolor/<size>/apps/net.cwchat.CwChat.png`, and
+the desktop entry refers to it as `Icon=net.cwchat.CwChat`.
+
 ## Build
 
 Requires Linux, Rust/Cargo, pkg-config, Clang/libclang, PipeWire development
