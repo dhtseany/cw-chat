@@ -119,6 +119,21 @@ impl Engine {
     pub fn send(&self, command: Command) {
         let _ = self.commands.send(command);
     }
+
+    /// A handle for sending commands from another thread (e.g. push-to-talk).
+    pub fn sender(&self) -> CommandSender {
+        CommandSender(self.commands.clone())
+    }
+}
+
+/// Cloneable, thread-safe handle for sending commands to a running engine.
+#[derive(Clone)]
+pub struct CommandSender(pw::channel::Sender<Command>);
+
+impl CommandSender {
+    pub fn send(&self, command: Command) {
+        let _ = self.0.send(command);
+    }
 }
 
 impl Drop for Engine {

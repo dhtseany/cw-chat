@@ -1,11 +1,12 @@
 //! GTK4/libadwaita chat window: a transcript of sent and received overs, an input
 //! row, RX level and speed, and TX/RX settings.
 
-use crate::{EngineArgs, ToneArgs, render};
+use crate::{EngineArgs, PttArgs, ToneArgs, render};
 use adw::prelude::*;
 use cw_chat::{
     audio::engine::{self, Command, Engine, Event},
     morse::encoder,
+    ptt::{self, Ptt, PttEvent},
     rx::decoder::{OverInfo, RxEvent, Status},
 };
 use gtk::{gdk, gio, glib};
@@ -23,9 +24,22 @@ const CSS: &str = "
 .bubble .message { font-size: 1.15em; }
 .keyed { color: @success_color; }
 .idle-key { color: alpha(@view_fg_color, 0.25); }
+.on-air { font-weight: bold; padding: 2px 10px; border-radius: 6px;
+          background-color: @error_bg_color; color: @error_fg_color; }
+.on-air.keying { background-color: @warning_bg_color; color: @warning_fg_color; }
 ";
 
-pub fn run(engine: EngineArgs, tone: ToneArgs) -> Result<(), Box<dyn std::error::Error>> {
+/// What the window hears from its background threads.
+enum UiEvent {
+    Engine(Event),
+    Ptt(PttEvent),
+}
+
+pub fn run(
+    engine: EngineArgs,
+    tone: ToneArgs,
+    ptt: PttArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Each launch is its own instance, so several copies can talk to each other.
     let app = adw::Application::builder()
         .application_id(APP_ID)
@@ -46,7 +60,7 @@ pub fn run(engine: EngineArgs, tone: ToneArgs) -> Result<(), Box<dyn std::error:
         app.set_accels_for_action("win.clear", &["<Ctrl>l"]);
         app.set_accels_for_action("win.new-line", &["<Ctrl>Return"]);
     });
-    app.connect_activate(move |app| build(app, engine.clone(), tone.clone()));
+    app.connect_activate(move |app| build(app, engine.clone(), tone.clone(), ptt.clone()));
     // Our options were parsed by clap; GTK gets none.
     let status = app.run_with_args::<&str>(&[]);
     if status != glib::ExitCode::SUCCESS {
@@ -72,6 +86,11 @@ struct RxRow {
 
 struct State {
     engine: Option<Engine>,
+    /// Sends messages to the engine, keying the radio around them when enabled.
+    ptt: Option<Ptt>,
+    /// Transmit on the tone RX is listening at (zero-beat with the other station).
+    tx_follows_rx: bool,
+    rx_tone: f64,
     tone: ToneArgs,
     next_id: u64,
     tx_rows: HashMap<u64, TxRow>,
@@ -101,9 +120,10 @@ struct Ui {
     syncing: Rc<std::cell::Cell<bool>>,
     toasts: adw::ToastOverlay,
     banner: adw::Banner,
+    on_air: gtk::Label,
 }
 
-fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
+fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs, ptt_args: PttArgs) {
     let config = engine_args.config(&tone);
     let title = match &config.name {
         Some(name) => format!("cw-chat — {name}"),
@@ -285,12 +305,23 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         syncing: Rc::new(std::cell::Cell::new(false)),
         toasts: toasts.clone(),
         banner,
+        on_air: gtk::Label::builder()
+            .css_classes(["on-air"])
+            .visible(false)
+            .tooltip_text("The radio is keyed through HRD")
+            .build(),
     };
 
-    // Engine, with events forwarded to this thread.
+    // Engine and push-to-talk, with events forwarded to this thread. Finished
+    // messages go straight to the PTT controller so unkeying never waits on GTK.
     let (sender, receiver) = async_channel::unbounded();
+    let (ptt_link, ptt_inbox) = ptt::link();
+    let engine_sender = sender.clone();
     let engine = match Engine::start(config.clone(), move |event| {
-        let _ = sender.try_send(event);
+        if let Event::TxDone(id) | Event::TxAborted(id) = event {
+            ptt_link.finished(id);
+        }
+        let _ = engine_sender.try_send(UiEvent::Engine(event));
     }) {
         Ok(engine) => Some(engine),
         Err(error) => {
@@ -298,8 +329,24 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
             None
         }
     };
+    let ptt_available = ptt_args.ptt.is_some();
+    let ptt = engine.as_ref().map(|engine| {
+        Ptt::start(
+            ptt_inbox,
+            ptt_args.keyer(),
+            ptt_available,
+            ptt_args.config(),
+            engine.sender(),
+            move |event| {
+                let _ = sender.try_send(UiEvent::Ptt(event));
+            },
+        )
+    });
     let state = Rc::new(RefCell::new(State {
         engine,
+        ptt,
+        tx_follows_rx: true,
+        rx_tone: config.rx_tone,
         tone: tone.clone(),
         next_id: 0,
         tx_rows: HashMap::new(),
@@ -312,7 +359,10 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         let (ui, state) = (ui.clone(), state.clone());
         glib::spawn_future_local(async move {
             while let Ok(event) = receiver.recv().await {
-                handle_event(&ui, &state, event);
+                match event {
+                    UiEvent::Engine(event) => handle_event(&ui, &state, event),
+                    UiEvent::Ptt(event) => handle_ptt(&ui, &state, event),
+                }
             }
         });
     }
@@ -325,7 +375,8 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         .tooltip_text("Clear the transcript (Ctrl+L)")
         .build();
     header.pack_start(&clear);
-    header.pack_end(&settings_button(&state, &config));
+    header.pack_end(&settings_button(&state, &config, ptt_available));
+    header.pack_end(&ui.on_air);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&toasts));
@@ -424,11 +475,16 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
     });
     window.add_controller(keys);
 
-    // Stop the PipeWire thread with the window.
+    // Unkey (PTT first), then stop the PipeWire thread, with the window.
     window.connect_close_request({
         let state = state.clone();
         move |_| {
-            state.borrow_mut().engine.take();
+            let (ptt, engine) = {
+                let mut st = state.borrow_mut();
+                (st.ptt.take(), st.engine.take())
+            };
+            drop(ptt);
+            drop(engine);
             glib::Propagation::Proceed
         }
     });
@@ -437,7 +493,11 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
     entry.grab_focus();
 }
 
-fn settings_button(state: &Rc<RefCell<State>>, config: &engine::Config) -> gtk::MenuButton {
+fn settings_button(
+    state: &Rc<RefCell<State>>,
+    config: &engine::Config,
+    ptt_available: bool,
+) -> gtk::MenuButton {
     let grid = gtk::Grid::builder()
         .row_spacing(8)
         .column_spacing(12)
@@ -460,6 +520,24 @@ fn settings_button(state: &Rc<RefCell<State>>, config: &engine::Config) -> gtk::
     wpm.set_value(tone.wpm);
     let tx_tone = gtk::SpinButton::with_range(300.0, 1500.0, 10.0);
     tx_tone.set_value(tone.tone);
+    let follow = gtk::Switch::builder()
+        .active(state.borrow().tx_follows_rx)
+        .halign(gtk::Align::Start)
+        .tooltip_text(
+            "Send on the pitch RX is listening at, to answer on the other station's frequency",
+        )
+        .build();
+    tx_tone.set_sensitive(!follow.is_active());
+    let key_radio = gtk::Switch::builder()
+        .active(ptt_available)
+        .sensitive(ptt_available)
+        .halign(gtk::Align::Start)
+        .tooltip_text(if ptt_available {
+            "Key the transmitter through HRD around each message"
+        } else {
+            "Start cw-chat with --ptt hrdctl to key the radio"
+        })
+        .build();
     let gain = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     gain.set_value(tone.gain);
     gain.set_hexpand(true);
@@ -475,11 +553,15 @@ fn settings_button(state: &Rc<RefCell<State>>, config: &engine::Config) -> gtk::
     grid.attach(&wpm, 1, 1, 1, 1);
     grid.attach(&label("Tone (Hz)"), 0, 2, 1, 1);
     grid.attach(&tx_tone, 1, 2, 1, 1);
-    grid.attach(&label("Gain"), 0, 3, 1, 1);
-    grid.attach(&gain, 1, 3, 1, 1);
-    grid.attach(&heading("Receive"), 0, 4, 2, 1);
-    grid.attach(&label("Mute while sending"), 0, 5, 1, 1);
-    grid.attach(&mute, 1, 5, 1, 1);
+    grid.attach(&label("TX tone follows RX tone"), 0, 3, 1, 1);
+    grid.attach(&follow, 1, 3, 1, 1);
+    grid.attach(&label("Gain"), 0, 4, 1, 1);
+    grid.attach(&gain, 1, 4, 1, 1);
+    grid.attach(&label("Key the radio (PTT)"), 0, 5, 1, 1);
+    grid.attach(&key_radio, 1, 5, 1, 1);
+    grid.attach(&heading("Receive"), 0, 6, 2, 1);
+    grid.attach(&label("Mute while sending"), 0, 7, 1, 1);
+    grid.attach(&mute, 1, 7, 1, 1);
 
     wpm.connect_value_changed({
         let state = state.clone();
@@ -492,6 +574,21 @@ fn settings_button(state: &Rc<RefCell<State>>, config: &engine::Config) -> gtk::
     gain.connect_value_changed({
         let state = state.clone();
         move |scale| state.borrow_mut().tone.gain = scale.value()
+    });
+    follow.connect_active_notify({
+        let (state, tx_tone) = (state.clone(), tx_tone.clone());
+        move |switch| {
+            state.borrow_mut().tx_follows_rx = switch.is_active();
+            tx_tone.set_sensitive(!switch.is_active());
+        }
+    });
+    key_radio.connect_active_notify({
+        let state = state.clone();
+        move |switch| {
+            if let Some(ptt) = &state.borrow().ptt {
+                ptt.set_enabled(switch.is_active());
+            }
+        }
     });
     mute.connect_active_notify({
         let state = state.clone();
@@ -511,8 +608,12 @@ fn command(state: &Rc<RefCell<State>>, command: Command) {
     }
 }
 
+/// Stop sending and clear the queue; the PTT controller also unkeys.
 fn abort(state: &Rc<RefCell<State>>) {
-    command(state, Command::Abort);
+    match &state.borrow().ptt {
+        Some(ptt) => ptt.abort(),
+        None => command(state, Command::Abort),
+    }
 }
 
 fn validate(ui: &Ui, text: &str) {
@@ -540,11 +641,15 @@ fn send_message(ui: &Ui, state: &Rc<RefCell<State>>) {
         return;
     }
     let mut st = state.borrow_mut();
-    if st.engine.is_none() {
+    if st.ptt.is_none() {
         ui.toasts.add_toast(adw::Toast::new("Audio is unavailable"));
         return;
     }
-    let (message, samples) = match render(&text, &st.tone) {
+    let mut tone = st.tone.clone();
+    if st.tx_follows_rx {
+        tone.tone = st.rx_tone;
+    }
+    let (message, samples) = match render(&text, &tone) {
         Ok(rendered) => rendered,
         Err(error) => {
             ui.toasts.add_toast(adw::Toast::new(&error.to_string()));
@@ -553,7 +658,7 @@ fn send_message(ui: &Ui, state: &Rc<RefCell<State>>) {
     };
     st.next_id += 1;
     let id = st.next_id;
-    let details = format!("{} WPM · {:.0} Hz", st.tone.wpm, st.tone.tone);
+    let details = format!("{} WPM · {:.0} Hz", tone.wpm, tone.tone);
     let (bubble, _, _) = bubble(ui, true, &format!("TX · {} · {details}", now()), &text);
     let morse = gtk::Label::builder()
         .label(message.to_string())
@@ -580,8 +685,8 @@ fn send_message(ui: &Ui, state: &Rc<RefCell<State>>) {
     st.tx_rows.insert(id, TxRow { status, progress });
     st.pending += 1;
     ui.stop.set_visible(true);
-    if let Some(engine) = &st.engine {
-        engine.send(Command::Send { id, samples });
+    if let Some(ptt) = &st.ptt {
+        ptt.submit(id, samples);
     }
     ui.entry.set_text("");
 }
@@ -600,15 +705,8 @@ fn handle_event(ui: &Ui, state: &Rc<RefCell<State>>, event: Event) {
                 row.progress.set_fraction(fraction);
             }
         }
-        Event::TxDone(id) | Event::TxAborted(id) => {
-            let done = matches!(event, Event::TxDone(_));
-            if let Some(row) = st.tx_rows.remove(&id) {
-                row.progress.set_visible(false);
-                row.status.set_label(if done { "Sent" } else { "Stopped" });
-            }
-            st.pending = st.pending.saturating_sub(1);
-            ui.stop.set_visible(st.pending > 0);
-        }
+        Event::TxDone(id) => finish_tx(ui, &mut st, id, true),
+        Event::TxAborted(id) => finish_tx(ui, &mut st, id, false),
         Event::Rx(RxEvent::Idle) => close_rx(&mut st),
         Event::Rx(RxEvent::Over(info)) => {
             close_rx(&mut st);
@@ -677,7 +775,45 @@ fn handle_event(ui: &Ui, state: &Rc<RefCell<State>>, event: Event) {
     }
 }
 
+fn finish_tx(ui: &Ui, st: &mut State, id: u64, sent: bool) {
+    if let Some(row) = st.tx_rows.remove(&id) {
+        row.progress.set_visible(false);
+        row.status.set_label(if sent { "Sent" } else { "Stopped" });
+    }
+    st.pending = st.pending.saturating_sub(1);
+    ui.stop.set_visible(st.pending > 0);
+}
+
+fn handle_ptt(ui: &Ui, state: &Rc<RefCell<State>>, event: PttEvent) {
+    let mut st = state.borrow_mut();
+    match event {
+        PttEvent::Keying => {
+            ui.on_air.set_label("KEYING");
+            ui.on_air.add_css_class("keying");
+            ui.on_air.set_visible(true);
+        }
+        PttEvent::Keyed => {
+            ui.on_air.set_label("ON AIR");
+            ui.on_air.remove_css_class("keying");
+            ui.on_air.set_visible(true);
+        }
+        PttEvent::Unkeyed => {
+            ui.on_air.set_visible(false);
+        }
+        PttEvent::MessageAborted(id) => finish_tx(ui, &mut st, id, false),
+        PttEvent::Error(message) => {
+            if message.starts_with("Could not unkey") {
+                ui.on_air.set_label("ON AIR · unkey failed, retrying");
+                ui.on_air.remove_css_class("keying");
+                ui.on_air.set_visible(true);
+            }
+            ui.toasts.add_toast(adw::Toast::new(&message));
+        }
+    }
+}
+
 fn show_status(ui: &Ui, st: &mut State, status: Status) {
+    st.rx_tone = status.tone;
     let db = 20.0 * status.level.max(1e-6).log10();
     ui.level
         .set_value(((db + 80.0) / 80.0).clamp(0.0, 1.0) as f64);

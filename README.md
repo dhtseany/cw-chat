@@ -95,6 +95,42 @@ cw-chat --name B --rx-from A
 order the copies start, and relinks if the other copy restarts. Both TX nodes also
 play to the default sink, so you hear the exchange; add `--manual` to keep them silent.
 
+## Transmitting through a radio
+
+cw-chat sends CW as an audio tone, so the radio must be in a USB data mode (DATA-U on
+Yaesu rigs) with the TX node's audio routed to the radio's data input: link
+`cw-chat-NAME-tx` in qpwgraph, or pass `--target`. The radio turns the tone into CW
+at the dial frequency plus the tone. **TX tone follows RX tone** (on by default, in
+the settings menu) sends on the pitch RX is tuned to, which answers the other
+station on their frequency. Keep the audio drive low enough that the radio's ALC
+barely moves.
+
+Without `--ptt`, keying is up to the radio (VOX, or PTT by hand). With `--ptt hrdctl`,
+cw-chat keys the transmitter through Ham Radio Deluxe using the `hrdctl` command from
+[smc-bridge-hrdctl](https://github.com/dhtseany/smc-bridge-hrdctl), which must be
+installed and able to reach HRD's TCP server:
+
+```sh
+cw-chat --name FT710 --ptt hrdctl                         # hrdctl's default HRD host
+cw-chat --ptt hrdctl --hrd-host 172.16.10.3 --hrd-port 7809 --ptt-button TX
+```
+
+For each transmission it runs `hrdctl button TX on`, waits `--ptt-lead-ms` (200) for
+the radio to switch, plays the messages (keeping the transmitter keyed across
+back-to-back messages), then runs `hrdctl unkey` `--ptt-tail-ms` (150) after the audio.
+The header shows **KEYING** and then **ON AIR** while the radio is keyed, and the
+settings menu has a **Key the radio (PTT)** switch.
+
+- Stop (Esc), a failed key, closing the window, and a watchdog (keyed 10 s past the
+  end of the expected audio) all stop the audio and unkey.
+- A key whose outcome is unknown (hrdctl exit code 3, or no answer within 20 s) counts
+  as keyed, so it is unkeyed too. If a key fails, nothing is sent.
+- A failed unkey is retried every 2 s, and the badge reads "unkey failed, retrying"
+  until it succeeds. Only a transmitter cw-chat keyed is unkeyed.
+- These are software safeguards. Keep a way to unkey that does not depend on
+  cw-chat (the radio's own controls, `hrdctl unkey`, an smc-bridge STOP key), and
+  set the radio's transmit timeout timer.
+
 ## Other modes
 
 ```sh
@@ -163,6 +199,7 @@ senders decode from a 20 WPM starting estimate.
 - `src/audio/engine.rs`: long-lived PipeWire thread with TX and RX nodes, message
   queue, RX muting, and the `--rx-from` linker
 - `src/audio/pipewire.rs`: one-shot playback for `send`
+- `src/ptt.rs`: push-to-talk controller and the `hrdctl` keyer
 - `src/ui/`: GTK4/libadwaita window
 - `src/main.rs`: CLI, subcommands, WAV import/export
 
@@ -185,10 +222,10 @@ never touch the desktop server or physical devices.
   with hardware monitors disabled, runs console copies A and B linked with
   `--rx-from`, and checks that each decoded the other's over.
 
-Validated in development: 24 unit tests, formatting, and Clippy pass; both scripts
+Validated in development: 36 unit tests, formatting, and Clippy pass; both scripts
 pass; both GUI copies start, link, and stay up under a headless compositor. The
-window has decoded live receive audio from a Yaesu FT-710; transmitting on air has not
-been tested.
+window has decoded live receive audio from a Yaesu FT-710; push-to-talk has been
+tested end to end against a stand-in `hrdctl`, not yet on the air.
 
 ## License
 

@@ -1,19 +1,21 @@
 mod ui;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use cw_chat::{
     audio::{
         self,
-        engine::{self, Command, Engine, Event},
+        engine::{self, Engine, Event},
     },
     cw::{oscillator, timing},
     morse::encoder,
+    ptt::{self, Hrdctl, Keyer, Ptt, PttConfig, PttEvent},
     rx::decoder::{self, RxEvent},
 };
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, mpsc},
+    time::Duration,
 };
 
 #[derive(Parser)]
@@ -29,6 +31,8 @@ struct Cli {
     engine: EngineArgs,
     #[command(flatten)]
     tone: ToneArgs,
+    #[command(flatten)]
+    ptt: PttArgs,
 }
 
 #[derive(Subcommand)]
@@ -43,7 +47,61 @@ enum Mode {
         engine: EngineArgs,
         #[command(flatten)]
         tone: ToneArgs,
+        #[command(flatten)]
+        ptt: PttArgs,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub enum PttBackend {
+    /// Ham Radio Deluxe, through the hrdctl command (smc-bridge-hrdctl)
+    Hrdctl,
+}
+
+#[derive(Args, Clone)]
+pub struct PttArgs {
+    /// Key the radio around each message (put the radio in DATA-U/USB)
+    #[arg(long, value_enum)]
+    pub ptt: Option<PttBackend>,
+    /// hrdctl command to run
+    #[arg(long, default_value = "hrdctl")]
+    pub hrdctl: PathBuf,
+    /// HRD host [default: hrdctl's, or HRD_HOST]
+    #[arg(long)]
+    pub hrd_host: Option<String>,
+    /// HRD port [default: hrdctl's, or HRD_PORT]
+    #[arg(long)]
+    pub hrd_port: Option<u16>,
+    /// HRD button that keys the transmitter
+    #[arg(long, default_value = "TX")]
+    pub ptt_button: String,
+    /// Milliseconds from keying to the start of audio
+    #[arg(long, default_value_t = 200)]
+    pub ptt_lead_ms: u64,
+    /// Milliseconds after the audio before unkeying
+    #[arg(long, default_value_t = 150)]
+    pub ptt_tail_ms: u64,
+}
+
+impl PttArgs {
+    pub fn keyer(&self) -> Option<Arc<dyn Keyer>> {
+        match self.ptt? {
+            PttBackend::Hrdctl => Some(Arc::new(Hrdctl::new(
+                &self.hrdctl,
+                self.hrd_host.clone(),
+                self.hrd_port,
+                &self.ptt_button,
+            ))),
+        }
+    }
+
+    pub fn config(&self) -> PttConfig {
+        PttConfig {
+            lead: Duration::from_millis(self.ptt_lead_ms),
+            tail: Duration::from_millis(self.ptt_tail_ms),
+            ..PttConfig::default()
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -226,15 +284,31 @@ enum Input {
     Line(String),
     Eof,
     Engine(Event),
+    Ptt(PttEvent),
 }
 
 /// Terminal chat on the engine; exits after stdin closes and queued messages finish.
-fn console(engine_args: EngineArgs, tone: ToneArgs) -> Result<(), Error> {
+fn console(engine_args: EngineArgs, tone: ToneArgs, ptt_args: PttArgs) -> Result<(), Error> {
     let (input, inbox) = mpsc::channel();
-    let engine_input = input.clone();
+    let (engine_input, ptt_input) = (input.clone(), input.clone());
+    let (ptt_link, ptt_inbox) = ptt::link();
     let engine = Engine::start(engine_args.config(&tone), move |event| {
+        if let Event::TxDone(id) | Event::TxAborted(id) = event {
+            ptt_link.finished(id);
+        }
         let _ = engine_input.send(Input::Engine(event));
     })?;
+    // Declared after the engine, so it is dropped (and unkeys) first.
+    let ptt = Ptt::start(
+        ptt_inbox,
+        ptt_args.keyer(),
+        ptt_args.ptt.is_some(),
+        ptt_args.config(),
+        engine.sender(),
+        move |event| {
+            let _ = ptt_input.send(Input::Ptt(event));
+        },
+    );
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
             let _ = input.send(Input::Line(line));
@@ -259,18 +333,20 @@ fn console(engine_args: EngineArgs, tone: ToneArgs) -> Result<(), Error> {
                         "TX #{next_id}: {} ({message})",
                         line.trim().to_uppercase()
                     )?;
-                    engine.send(Command::Send {
-                        id: next_id,
-                        samples,
-                    });
+                    ptt.submit(next_id, samples);
                 }
                 Err(error) => eprintln!("cw-chat: {error}"),
             },
             Input::Eof => closing = true,
-            Input::Engine(Event::TxDone(id) | Event::TxAborted(id)) => {
+            Input::Engine(Event::TxDone(id) | Event::TxAborted(id))
+            | Input::Ptt(PttEvent::MessageAborted(id)) => {
                 pending -= 1;
                 writeln!(out, "TX #{id} done")?;
             }
+            Input::Ptt(PttEvent::Keying) => eprintln!("cw-chat: keying the radio"),
+            Input::Ptt(PttEvent::Keyed) => eprintln!("cw-chat: ON AIR"),
+            Input::Ptt(PttEvent::Unkeyed) => eprintln!("cw-chat: unkeyed"),
+            Input::Ptt(PttEvent::Error(message)) => eprintln!("cw-chat: {message}"),
             // An over that ended with nothing printed since (e.g. our TX interrupted it).
             Input::Engine(Event::Rx(RxEvent::Idle)) if !rx_line => {}
             Input::Engine(Event::Rx(RxEvent::OverUpdate(_))) => {}
@@ -322,8 +398,8 @@ fn main() {
     let result = match cli.command {
         Some(Mode::Send(args)) => send(args),
         Some(Mode::Decode(args)) => decode(args),
-        Some(Mode::Console { engine, tone }) => console(engine, tone),
-        None => ui::run(cli.engine, cli.tone),
+        Some(Mode::Console { engine, tone, ptt }) => console(engine, tone, ptt),
+        None => ui::run(cli.engine, cli.tone, cli.ptt),
     };
     if let Err(error) = result {
         eprintln!("cw-chat: {error}");
