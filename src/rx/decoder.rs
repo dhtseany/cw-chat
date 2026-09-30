@@ -52,7 +52,9 @@ const IDLE_SECONDS: f64 = 2.5;
 /// A tone longer than this is a carrier or a new noise floor, not an element.
 const CARRIER_SECONDS: f64 = 2.0;
 const MAX_PATTERN: usize = 10;
-const WARMUP_HOPS: usize = 20;
+/// Hops (400 ms) held to estimate the noise floor from their quietest quarter. Long
+/// enough to include element gaps even when audio starts on a dash.
+const WARMUP_HOPS: usize = 80;
 /// Marks shorter than this fraction of a dot are noise spikes.
 const GLITCH: f64 = 0.35;
 /// Stations closer than this in pitch AND level are treated as the same sender.
@@ -143,7 +145,7 @@ pub struct Decoder {
     peak: f32,
     peak_decay: f32,
     peak_decay_fast: f32,
-    /// Bins from the first 100 ms, held until the noise floor can be estimated.
+    /// Bins from the first 400 ms, held until the noise floor can be estimated.
     warmup: Option<Vec<Bin>>,
     /// Previous bin, when it was part of a steady keyed tone (for pitch).
     previous: Option<Bin>,
@@ -659,6 +661,11 @@ mod tests {
             decode_all(&render("E", 20.0, 700.0), RATE, 700.0, 20.0),
             "E"
         );
+        // Starting on a dash leaves no gap in the first 100 ms.
+        let audio = render("CQ DE W8ABC K", 20.0, 700.0);
+        assert_eq!(decode_all(&audio, RATE, 700.0, 20.0), "CQ DE W8ABC K");
+        let audio = render("TTT MMM", 13.0, 700.0);
+        assert_eq!(decode_all(&audio, RATE, 700.0, 20.0), "TTT MMM");
     }
 
     #[test]

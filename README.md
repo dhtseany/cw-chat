@@ -97,13 +97,46 @@ play to the default sink, so you hear the exchange; add `--manual` to keep them 
 
 ## Transmitting through a radio
 
-cw-chat sends CW as an audio tone, so the radio must be in a USB data mode (DATA-U on
+There are two ways to transmit: key the radio's own CW from an audio keying tone
+(recommended), or send the CW tone as audio in a USB data mode.
+
+### Keying tone (radio in CW mode)
+
+`--tx-output key` (or **Output: Keying tone** in the settings menu) makes the TX node
+send a keying tone instead of CW audio: `--key-tone` (1600 Hz) at `--key-level` (0.8)
+while each element is down, with 1 ms edges, and silence otherwise. An audio-to-key
+interface turns tone-present into a key closure on the radio's KEY jack, so the radio
+stays in CW mode: it generates the CW with its own shaping and sidetone, its CW
+filters and pitch stay as they are for receiving, and its break-in switches between
+receive and transmit. It works with any radio that has a straight-key input, and needs
+no CAT, split, or USB data setup.
+
+This is the same scheme as fldigi's "QSK on right channel" (also a 1600 Hz tone). Its
+documented interface is a small isolation transformer feeding a full-wave voltage
+doubler whose DC output switches an NPN transistor (2N2222) that grounds the key
+line; see [fldigi's CW keying page](https://www.w1hkj.org/FldigiHelp/cw_keying_page.html)
+and [KK5JY's updated version](http://www.kk5jy.net/a1a-fldigi/) with current parts and
+a level trimmer. Check your radio's key-line voltage and current in its manual before
+connecting anything (the FT-450's is 5 V key-up, 0.5 mA key-down).
+
+Route `cw-chat-NAME-tx` to the audio output wired to the interface (a spare channel is
+fine), set the radio to CW with its internal keyer off (straight key), and turn on
+semi or full break-in. `cw-chat send --tx-output key "TTTTT"` sends a steady run of
+dashes for setting the interface's level. The tone and speed settings for CW audio do
+not apply: the radio sends at its own pitch, on the frequency you are tuned to.
+
+### CW audio (radio in USB/DATA mode)
+
+With the default `--tx-output audio`, the radio must be in a USB data mode (DATA-U on
 Yaesu rigs) with the TX node's audio routed to the radio's data input: link
 `cw-chat-NAME-tx` in qpwgraph, or pass `--target`. The radio turns the tone into CW
 at the dial frequency plus the tone. **TX tone follows RX tone** (on by default, in
 the settings menu) sends on the pitch RX is tuned to, which answers the other
 station on their frequency. Keep the audio drive low enough that the radio's ALC
 barely moves.
+
+In a data mode the radio receives differently from CW mode (a station you are tuned to
+is near zero beat), which is why the keying tone is usually the better choice.
 
 Without `--ptt`, keying is up to the radio (VOX, or PTT by hand). With `--ptt hrdctl`,
 cw-chat keys the transmitter through Ham Radio Deluxe using the `hrdctl` command from
@@ -170,7 +203,7 @@ Input is limited to 4096 bytes and rendered transmissions to ten minutes.
   (about 100 Hz bandwidth), evaluated every 5 ms at the RX tone.
 - **Keying:** keys on when the tone is 3× (9.5 dB) above a running mean of the noise
   floor, with hysteresis, a 10 ms debounce, and a glitch filter that drops marks
-  shorter than about a third of a dot. The first 100 ms set the noise floor from their
+  shorter than about a third of a dot. The first 400 ms set the noise floor from their
   quietest quarter and are then replayed, so audio that starts mid-tone decodes.
   Tones longer than 2 s are treated as a carrier or new noise floor.
 - **Auto tuning:** a bank of DFT bins every 10 Hz from 300 to 1200 Hz (21 ms window)
@@ -222,7 +255,7 @@ never touch the desktop server or physical devices.
   with hardware monitors disabled, runs console copies A and B linked with
   `--rx-from`, and checks that each decoded the other's over.
 
-Validated in development: 36 unit tests, formatting, and Clippy pass; both scripts
+Validated in development: 37 unit tests, formatting, and Clippy pass; both scripts
 pass; both GUI copies start, link, and stay up under a headless compositor. The
 window has decoded live receive audio from a Yaesu FT-710; push-to-talk has been
 tested end to end against a stand-in `hrdctl`, not yet on the air.

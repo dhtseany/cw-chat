@@ -114,6 +114,41 @@ pub struct ToneArgs {
     pub tone: f64,
     #[arg(long, default_value_t = 0.2)]
     pub gain: f64,
+    /// What TX sends: `audio` is the CW tone (for speakers, or a radio in USB/DATA
+    /// mode); `key` is a keying tone for an audio-to-key interface on the radio's KEY
+    /// jack, with the radio in CW mode
+    #[arg(long, value_enum, default_value_t = TxOutput::Audio)]
+    pub tx_output: TxOutput,
+    /// Keying tone frequency in Hz (key output)
+    #[arg(long, default_value_t = 1600.0)]
+    pub key_tone: f64,
+    /// Keying tone level, 0-1 (key output); the interface's rectifier needs a strong signal
+    #[arg(long, default_value_t = 0.8)]
+    pub key_level: f64,
+}
+
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TxOutput {
+    /// The CW audio tone
+    Audio,
+    /// A keying tone for an audio-to-key interface
+    Key,
+}
+
+impl ToneArgs {
+    /// Render the elements as TX audio or as a keying tone.
+    pub fn render(&self, events: &[timing::Event]) -> Result<Vec<f32>, String> {
+        match self.tx_output {
+            TxOutput::Audio => oscillator::render(events, self.wpm, self.tone, self.gain),
+            TxOutput::Key => oscillator::render_with_ramp(
+                events,
+                self.wpm,
+                self.key_tone,
+                self.key_level,
+                oscillator::KEY_RAMP_SECONDS,
+            ),
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -194,8 +229,7 @@ pub fn render(text: &str, tone: &ToneArgs) -> Result<(encoder::Message, Vec<f32>
         return Err("Text is limited to 4096 bytes per transmission".into());
     }
     let message = encoder::encode(text)?;
-    let mut samples =
-        oscillator::render(&timing::schedule(&message), tone.wpm, tone.tone, tone.gain)?;
+    let mut samples = tone.render(&timing::schedule(&message))?;
     samples.extend(oscillator::gap(7, tone.wpm));
     Ok((message, samples))
 }
@@ -215,13 +249,16 @@ fn send(args: SendArgs) -> Result<(), Error> {
     }
     let tone = &args.tone;
     let message = encoder::encode(&text)?;
-    let samples = oscillator::render(&timing::schedule(&message), tone.wpm, tone.tone, tone.gain)?;
+    let samples = tone.render(&timing::schedule(&message))?;
     println!("{message}");
+    let output = match tone.tx_output {
+        TxOutput::Audio => format!("{} Hz", tone.tone),
+        TxOutput::Key => format!("{} Hz keying tone", tone.key_tone),
+    };
     println!(
-        "{:.2}s at {} WPM, {} Hz",
+        "{:.2}s at {} WPM, {output}",
         samples.len() as f64 / oscillator::SAMPLE_RATE as f64,
-        tone.wpm,
-        tone.tone
+        tone.wpm
     );
     if let Some(path) = args.wav {
         let mut writer = hound::WavWriter::create(

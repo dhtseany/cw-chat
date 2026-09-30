@@ -1,7 +1,7 @@
 //! GTK4/libadwaita chat window: a transcript of sent and received overs, an input
 //! row, RX level and speed, and TX/RX settings.
 
-use crate::{EngineArgs, PttArgs, ToneArgs, render};
+use crate::{EngineArgs, PttArgs, ToneArgs, TxOutput, render};
 use adw::prelude::*;
 use cw_chat::{
     audio::engine::{self, Command, Engine, Event},
@@ -527,7 +527,6 @@ fn settings_button(
             "Send on the pitch RX is listening at, to answer on the other station's frequency",
         )
         .build();
-    tx_tone.set_sensitive(!follow.is_active());
     let key_radio = gtk::Switch::builder()
         .active(ptt_available)
         .sensitive(ptt_available)
@@ -548,20 +547,74 @@ fn settings_button(
         .halign(gtk::Align::Start)
         .build();
 
+    let output = gtk::DropDown::from_strings(&["CW audio", "Keying tone"]);
+    output.set_selected(u32::from(tone.tx_output == TxOutput::Key));
+    output.set_tooltip_text(Some(
+        "CW audio: the tone itself (speakers, or a radio in USB/DATA mode). \
+         Keying tone: drives an audio-to-key interface on the radio's KEY jack, \
+         with the radio in CW mode",
+    ));
+    let key_level = gtk::SpinButton::with_range(0.05, 1.0, 0.05);
+    key_level.set_digits(2);
+    key_level.set_value(tone.key_level);
+    key_level.set_tooltip_text(Some(&format!(
+        "Level of the {:.0} Hz keying tone; the interface's rectifier needs a strong signal",
+        tone.key_tone
+    )));
+
     grid.attach(&heading("Transmit"), 0, 0, 2, 1);
-    grid.attach(&label("Speed (WPM)"), 0, 1, 1, 1);
-    grid.attach(&wpm, 1, 1, 1, 1);
-    grid.attach(&label("Tone (Hz)"), 0, 2, 1, 1);
-    grid.attach(&tx_tone, 1, 2, 1, 1);
-    grid.attach(&label("TX tone follows RX tone"), 0, 3, 1, 1);
-    grid.attach(&follow, 1, 3, 1, 1);
-    grid.attach(&label("Gain"), 0, 4, 1, 1);
-    grid.attach(&gain, 1, 4, 1, 1);
-    grid.attach(&label("Key the radio (PTT)"), 0, 5, 1, 1);
-    grid.attach(&key_radio, 1, 5, 1, 1);
-    grid.attach(&heading("Receive"), 0, 6, 2, 1);
-    grid.attach(&label("Mute while sending"), 0, 7, 1, 1);
-    grid.attach(&mute, 1, 7, 1, 1);
+    grid.attach(&label("Output"), 0, 1, 1, 1);
+    grid.attach(&output, 1, 1, 1, 1);
+    grid.attach(&label("Speed (WPM)"), 0, 2, 1, 1);
+    grid.attach(&wpm, 1, 2, 1, 1);
+    grid.attach(&label("Tone (Hz)"), 0, 3, 1, 1);
+    grid.attach(&tx_tone, 1, 3, 1, 1);
+    grid.attach(&label("TX tone follows RX tone"), 0, 4, 1, 1);
+    grid.attach(&follow, 1, 4, 1, 1);
+    grid.attach(&label("Gain"), 0, 5, 1, 1);
+    grid.attach(&gain, 1, 5, 1, 1);
+    grid.attach(&label("Key level"), 0, 6, 1, 1);
+    grid.attach(&key_level, 1, 6, 1, 1);
+    grid.attach(&label("Key the radio (PTT)"), 0, 7, 1, 1);
+    grid.attach(&key_radio, 1, 7, 1, 1);
+    grid.attach(&heading("Receive"), 0, 8, 2, 1);
+    grid.attach(&label("Mute while sending"), 0, 9, 1, 1);
+    grid.attach(&mute, 1, 9, 1, 1);
+
+    // Tone, follow, and gain shape CW audio; key level applies to the keying tone.
+    let update_sensitivity = {
+        let (output, tx_tone, follow, gain, key_level) = (
+            output.clone(),
+            tx_tone.clone(),
+            follow.clone(),
+            gain.clone(),
+            key_level.clone(),
+        );
+        move || {
+            let key = output.selected() == 1;
+            tx_tone.set_sensitive(!key && !follow.is_active());
+            follow.set_sensitive(!key);
+            gain.set_sensitive(!key);
+            key_level.set_sensitive(key);
+        }
+    };
+    update_sensitivity();
+    let update_sensitivity = Rc::new(update_sensitivity);
+    output.connect_selected_notify({
+        let (state, update) = (state.clone(), update_sensitivity.clone());
+        move |output| {
+            state.borrow_mut().tone.tx_output = if output.selected() == 1 {
+                TxOutput::Key
+            } else {
+                TxOutput::Audio
+            };
+            update();
+        }
+    });
+    key_level.connect_value_changed({
+        let state = state.clone();
+        move |spin| state.borrow_mut().tone.key_level = spin.value()
+    });
 
     wpm.connect_value_changed({
         let state = state.clone();
@@ -576,10 +629,10 @@ fn settings_button(
         move |scale| state.borrow_mut().tone.gain = scale.value()
     });
     follow.connect_active_notify({
-        let (state, tx_tone) = (state.clone(), tx_tone.clone());
+        let (state, update) = (state.clone(), update_sensitivity.clone());
         move |switch| {
             state.borrow_mut().tx_follows_rx = switch.is_active();
-            tx_tone.set_sensitive(!switch.is_active());
+            update();
         }
     });
     key_radio.connect_active_notify({
@@ -658,7 +711,10 @@ fn send_message(ui: &Ui, state: &Rc<RefCell<State>>) {
     };
     st.next_id += 1;
     let id = st.next_id;
-    let details = format!("{} WPM · {:.0} Hz", tone.wpm, tone.tone);
+    let details = match tone.tx_output {
+        TxOutput::Audio => format!("{} WPM · {:.0} Hz", tone.wpm, tone.tone),
+        TxOutput::Key => format!("{} WPM · keying", tone.wpm),
+    };
     let (bubble, _, _) = bubble(ui, true, &format!("TX · {} · {details}", now()), &text);
     let morse = gtk::Label::builder()
         .label(message.to_string())
