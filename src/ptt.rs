@@ -362,10 +362,17 @@ impl Controller {
                 (self.events)(PttEvent::MessageAborted(id));
             }
             Input::Submit { id, samples } => {
-                if !self.enabled {
+                if !self.enabled && !self.keyed && !self.busy {
                     // No radio control: straight to the engine (VOX or manual PTT).
+                    // Never while a transmitter we keyed may still be keyed or a key
+                    // or unkey is in flight: those wait in the queue (see advance).
                     (self.engine)(Command::Send { id, samples });
-                } else if self.keyed && !self.busy && self.leading.is_none() && !self.unkey_wanted {
+                } else if self.enabled
+                    && self.keyed
+                    && !self.busy
+                    && self.leading.is_none()
+                    && !self.unkey_wanted
+                {
                     // Already on the air: keep the transmitter keyed and send.
                     self.tail = None;
                     self.send(id, samples);
@@ -417,11 +424,19 @@ impl Controller {
                         (self.events)(PttEvent::Error(format!(
                             "Could not key the radio: {message}"
                         )));
-                        self.drop_pending();
+                        // Keying was switched off meanwhile: the radio is not keyed,
+                        // so queued messages go out as plain audio (see advance).
+                        if self.enabled {
+                            self.drop_pending();
+                        }
                         return;
                     }
                 }
-                if self.unkey_wanted || self.pending.is_empty() || self.shutting_down {
+                if self.unkey_wanted
+                    || self.pending.is_empty()
+                    || self.shutting_down
+                    || !self.enabled
+                {
                     self.unkey_wanted = true;
                 } else {
                     self.leading = Some(Instant::now() + self.config.lead);
@@ -476,6 +491,14 @@ impl Controller {
     /// Start whatever the state calls for next, if the radio is not busy.
     fn advance(&mut self) {
         if self.busy || self.retry.is_some() {
+            return;
+        }
+        if !self.enabled && !self.keyed {
+            // Keying is off and the transmitter we keyed is confirmed unkeyed:
+            // messages queued meanwhile go straight to the engine.
+            for (id, samples) in std::mem::take(&mut self.pending) {
+                (self.engine)(Command::Send { id, samples });
+            }
             return;
         }
         let Some(keyer) = self.keyer.clone() else {
@@ -809,6 +832,64 @@ mod tests {
         log.wait_for("send 1");
         drop(ptt);
         assert_eq!(log.actions(), ["send 1", "abort"]);
+    }
+
+    #[test]
+    fn disabling_while_keyed_holds_messages_until_unkeyed() {
+        // A slow unkey: the next message must not reach the engine before it ends.
+        let (ptt, _link, log) = start(vec![], 0, Duration::from_millis(100), config());
+        ptt.submit(1, audio());
+        log.wait_for("send 1");
+        ptt.set_enabled(false);
+        ptt.submit(2, audio());
+        log.wait_for("send 2");
+        drop(ptt);
+        let actions = log.actions();
+        let position = |a: &str| actions.iter().position(|x| x == a).unwrap();
+        assert!(position("unkey") < position("send 2"), "{actions:?}");
+        assert_eq!(&actions[..4], ["key", "send 1", "abort", "unkey"]);
+    }
+
+    #[test]
+    fn disabling_with_a_failing_unkey_holds_messages_until_it_succeeds() {
+        let (ptt, _link, log) = start(vec![], 2, Duration::ZERO, config());
+        ptt.submit(1, audio());
+        log.wait_for("send 1");
+        ptt.set_enabled(false);
+        ptt.submit(2, audio());
+        log.wait_for("send 2");
+        drop(ptt);
+        assert_eq!(
+            &log.actions()[..6],
+            [
+                "key",
+                "send 1",
+                "abort",
+                "unkey failed",
+                "unkey failed",
+                "unkey"
+            ]
+        );
+        assert_eq!(log.actions()[6], "send 2");
+    }
+
+    #[test]
+    fn disabling_while_keying_unkeys_then_sends_as_audio() {
+        let (ptt, _link, log) = start(vec![], 0, Duration::from_millis(50), config());
+        ptt.submit(1, audio());
+        std::thread::sleep(Duration::from_millis(10));
+        ptt.set_enabled(false);
+        ptt.submit(2, audio());
+        log.wait_for("send 2");
+        drop(ptt);
+        let actions = log.actions();
+        // Message 1 was dropped by the abort; 2 waited for the key to be undone.
+        assert_eq!(
+            &actions[..4],
+            ["abort", "key", "unkey", "send 2"],
+            "{actions:?}"
+        );
+        assert!(!actions.contains(&"send 1".to_owned()));
     }
 
     #[test]

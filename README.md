@@ -255,7 +255,7 @@ never touch the desktop server or physical devices.
   with hardware monitors disabled, runs console copies A and B linked with
   `--rx-from`, and checks that each decoded the other's over.
 
-Validated in development: 37 unit tests, formatting, and Clippy pass; both scripts
+Validated in development: 40 unit tests, formatting, and Clippy pass; both scripts
 pass; both GUI copies start, link, and stay up under a headless compositor. The
 window has decoded live receive audio from a Yaesu FT-710; push-to-talk has been
 tested end to end against a stand-in `hrdctl`, not yet on the air.
