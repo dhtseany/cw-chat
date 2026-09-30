@@ -4,6 +4,19 @@ A CW (Morse) chat app for Linux: a GTK4/libadwaita window that sends typed text 
 CW audio and decodes received CW into the same transcript, over native PipeWire.
 No CAT, PTT, or radio control yet.
 
+## Install
+
+From the AUR, as `cw-chat`, with an AUR helper or by hand:
+
+```sh
+git clone https://aur.archlinux.org/cw-chat.git
+cd cw-chat
+makepkg -si
+```
+
+It installs `/usr/bin/cw-chat` and a "CW Chat" launcher entry. The package builds a
+tagged release from GitHub and runs the test suite first.
+
 ## Build
 
 Requires Linux, Rust/Cargo, pkg-config, Clang/libclang, PipeWire development
@@ -29,8 +42,22 @@ bubble starts after 2.5 seconds of silence. Below the transcript are the RX leve
 meter, a key indicator lit while a tone is detected, and the sender's estimated
 speed. Press Enter or Send to transmit; messages sent while another is playing are
 queued. Stop (or Esc) aborts the current message and clears the queue. The settings
-menu adjusts TX speed, tone, and gain, the RX tone, and whether RX is muted while
-sending (on by default, so your own audio is not decoded).
+menu adjusts TX speed, tone, and gain, and whether RX is muted while sending (on by
+default, so your own audio is not decoded).
+
+The **Tone** slider under the RX meter sets the audio pitch the decoder listens for
+(300–1200 Hz). It must match the pitch your radio produces, within about 50 Hz; a
+mismatch shows up as strings of `E`. With **Auto** on (the default), the decoder
+finds the strongest CW signal in that range, follows it as it drifts, and moves to
+each station as it starts sending; the slider shows where it has tuned. Dragging
+the slider switches to a fixed tone; click Auto to hand control back.
+
+Received overs are split and labelled by station: after a pause, a character more
+than 15 Hz or 10 dB away from the current over starts a new one, and stations are
+remembered (Station A, B, ...) with their pitch and level in the bubble header.
+Right-click the transcript for Copy Message, Copy All (Ctrl+Shift+C), New Line
+(Ctrl+Enter, ends the current RX bubble now), and Clear (Ctrl+L); all bubble text
+is selectable.
 
 Each copy creates two PipeWire nodes: `cw-chat-tx` (playback) and `cw-chat-rx`
 (capture). By default TX goes to the default sink and RX listens to the default
@@ -43,7 +70,7 @@ source, both routed by the session manager. Options (also accepted by `console`)
 --rx-from NODE      link NODE (or another instance's NAME) straight into RX
 --manual            leave both nodes unconnected, for routing in qpwgraph
 --wpm, --tone, --gain   TX settings (defaults 20 WPM, 700 Hz, 0.2)
---rx-tone HZ        RX tone (default: the TX tone)
+--rx-tone HZ        fix the RX tone (default: automatic, starting at the TX tone)
 --full-duplex       keep decoding while transmitting
 ```
 
@@ -68,7 +95,8 @@ play to the default sink, so you hear the exchange; add `--manual` to keep them 
 ```sh
 cw-chat send "CQ CQ DE W8ABC"           # send one message and exit
 cw-chat send --wav hello.wav "HELLO"    # export instead of playing
-cw-chat decode recording.wav            # decode a WAV file (any rate, mixed to mono)
+cw-chat decode recording.wav            # decode a WAV file (any rate, mixed to mono;
+                                        # tone found automatically unless --tone)
 cw-chat console --name A --rx-from B    # terminal chat: stdin lines out, RX printed
 ```
 
@@ -104,6 +132,14 @@ Input is limited to 4096 bytes and rendered transmissions to ten minutes.
   shorter than about a third of a dot. The first 100 ms set the noise floor from their
   quietest quarter and are then replayed, so audio that starts mid-tone decodes.
   Tones longer than 2 s are treated as a carrier or new noise floor.
+- **Auto tuning:** a bank of DFT bins every 10 Hz from 300 to 1200 Hz (21 ms window)
+  finds tones that are well above the band's median and keyed (they return to the
+  floor between elements, which excludes carriers). The decoder jumps only between
+  characters: after a pause, or mid-over when nothing is keying at the current tone,
+  replaying the last 0.25 s so a first letter is kept. Per-character pitch
+  measurement then keeps it centred.
+- **Stations:** pitch comes from the detector's phase rotation between hops (to
+  within a few Hz); level is the mean keyed dBFS.
 - **Timing:** dots and dashes are clustered separately and track the sender's speed
   (5–60 WPM) from any starting estimate; gaps are split at 2 and 5 units. Unknown
   patterns decode as `*`.
@@ -118,7 +154,7 @@ senders decode from a 20 WPM starting estimate.
 - `src/morse/`: character table (with reverse lookup) and strict text encoding
 - `src/cw/timing.rs`: tone/silence events in dot units
 - `src/cw/oscillator.rs`: sine generation, envelopes, sample timing
-- `src/rx/`: tone detector and adaptive decoder
+- `src/rx/`: tone detector, band-wide auto tuner, and adaptive decoder
 - `src/audio/engine.rs`: long-lived PipeWire thread with TX and RX nodes, message
   queue, RX muting, and the `--rx-from` linker
 - `src/audio/pipewire.rs`: one-shot playback for `send`
@@ -144,10 +180,10 @@ never touch the desktop server or physical devices.
   with hardware monitors disabled, runs console copies A and B linked with
   `--rx-from`, and checks that each decoded the other's over.
 
-Validated in development: 15 unit tests, formatting, and Clippy pass; both scripts
+Validated in development: 24 unit tests, formatting, and Clippy pass; both scripts
 pass; both GUI copies start, link, and stay up under a headless compositor. The
-window has not yet been exercised by hand, and physical-device and on-air use have
-not been auditioned.
+window has decoded live receive audio from a Yaesu FT-710; transmitting on air has not
+been tested.
 
 ## License
 

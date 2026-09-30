@@ -43,7 +43,7 @@ A=$!
 wait $A $B
 
 for side in a b; do echo "== $side"; cat "$ROOT"/$side.out "$ROOT"/$side.err; done
-if grep -q "^RX: CQ CQ DE A K" "$ROOT"/b.out && grep -q "^RX: A DE B GM" "$ROOT"/a.out; then
+if grep -q "^RX station A ([0-9]* Hz, -*[0-9]* dBFS): CQ CQ DE A K" "$ROOT"/b.out && grep -q "^RX station A ([0-9]* Hz, -*[0-9]* dBFS): A DE B GM" "$ROOT"/a.out; then
     echo "PASS: each copy decoded the other's over"
 else
     echo "FAIL"; exit 1

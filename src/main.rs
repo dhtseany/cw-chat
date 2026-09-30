@@ -75,7 +75,8 @@ pub struct EngineArgs {
     /// Leave both nodes unconnected, for routing in qpwgraph
     #[arg(long)]
     pub manual: bool,
-    /// RX tone in Hz [default: the TX tone]
+    /// Fix the RX tone in Hz; without it, RX follows the signal automatically,
+    /// starting from the TX tone
     #[arg(long)]
     pub rx_tone: Option<f64>,
     /// Keep decoding while transmitting
@@ -92,6 +93,7 @@ impl EngineArgs {
             rx_from: self.rx_from.clone(),
             manual: self.manual,
             rx_tone: self.rx_tone.unwrap_or(tone.tone),
+            rx_auto: self.rx_tone.is_none(),
             rx_wpm_hint: tone.wpm,
             rx_mute: !self.full_duplex,
         }
@@ -118,8 +120,9 @@ struct SendArgs {
 #[derive(Args)]
 struct DecodeArgs {
     file: PathBuf,
-    #[arg(long, default_value_t = 700.0)]
-    tone: f64,
+    /// Tone in Hz; without it, the tone is found automatically
+    #[arg(long)]
+    tone: Option<f64>,
     /// Starting speed estimate; the decoder adapts to the sender
     #[arg(long, default_value_t = 20.0)]
     wpm: f64,
@@ -208,7 +211,13 @@ fn decode(args: DecodeArgs) -> Result<(), Error> {
         .collect();
     println!(
         "{}",
-        decoder::decode_all(&mono, spec.sample_rate, args.tone, args.wpm)
+        decoder::decode_all_with(
+            &mono,
+            spec.sample_rate,
+            args.tone.unwrap_or(700.0),
+            args.wpm,
+            args.tone.is_none()
+        )
     );
     Ok(())
 }
@@ -264,6 +273,20 @@ fn console(engine_args: EngineArgs, tone: ToneArgs) -> Result<(), Error> {
             }
             // An over that ended with nothing printed since (e.g. our TX interrupted it).
             Input::Engine(Event::Rx(RxEvent::Idle)) if !rx_line => {}
+            Input::Engine(Event::Rx(RxEvent::OverUpdate(_))) => {}
+            Input::Engine(Event::Rx(RxEvent::Over(over))) => {
+                if rx_line {
+                    writeln!(out)?;
+                }
+                write!(
+                    out,
+                    "RX station {} ({:.0} Hz, {:.0} dBFS): ",
+                    (b'A' + (over.station % 26) as u8) as char,
+                    over.pitch_hz,
+                    over.level_db
+                )?;
+                rx_line = true;
+            }
             Input::Engine(Event::Rx(event)) => {
                 if !rx_line {
                     write!(out, "RX: ")?;
@@ -276,6 +299,7 @@ fn console(engine_args: EngineArgs, tone: ToneArgs) -> Result<(), Error> {
                         writeln!(out)?;
                         rx_line = false;
                     }
+                    RxEvent::Over(_) | RxEvent::OverUpdate(_) => unreachable!(),
                 }
                 out.flush()?;
             }

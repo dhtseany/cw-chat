@@ -2,3 +2,6 @@
 *.wav
 # Local session handoff notes; not published
 primer.md
+
+# Maintained in the AUR (cw-chat), not here; kept locally for release updates.
+PKGBUILD

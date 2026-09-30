@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=CW Chat
+GenericName=Morse Code Chat
+Comment=Send and decode CW (Morse code) as a chat, over PipeWire
+Exec=cw-chat
+Icon=audio-input-microphone
+Terminal=false
+Categories=Audio;AudioVideo;HamRadio;
+Keywords=morse;cw;ham;amateur;radio;pipewire;decoder;
+StartupNotify=true

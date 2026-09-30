@@ -30,7 +30,9 @@ pub struct Config {
     pub rx_from: Option<String>,
     /// Leave both nodes unconnected, for manual routing in qpwgraph.
     pub manual: bool,
+    /// RX tone, or the starting point when `rx_auto` follows the signal.
     pub rx_tone: f64,
+    pub rx_auto: bool,
     pub rx_wpm_hint: f64,
     /// Ignore RX while transmitting, so our own audio is not decoded.
     pub rx_mute: bool,
@@ -55,6 +57,7 @@ pub enum Command {
     /// Stop the current message and clear the queue.
     Abort,
     SetRxTone(f64),
+    SetRxAuto(bool),
     SetRxMute(bool),
     Quit,
 }
@@ -175,7 +178,8 @@ fn run(
         since_report: 0,
     }));
     let rx = Rc::new(RefCell::new(Rx {
-        decoder: Decoder::new(SAMPLE_RATE, config.rx_tone, config.rx_wpm_hint),
+        decoder: Decoder::new(SAMPLE_RATE, config.rx_tone, config.rx_wpm_hint)
+            .with_auto(config.rx_auto),
         mute: config.rx_mute,
         muted_samples: 0,
         since_report: 0,
@@ -375,6 +379,7 @@ fn run(
             }
         }
         Command::SetRxTone(tone) => rx_state.borrow_mut().decoder.set_frequency(tone),
+        Command::SetRxAuto(auto) => rx_state.borrow_mut().decoder.set_auto(auto),
         Command::SetRxMute(mute) => rx_state.borrow_mut().mute = mute,
         Command::Quit => quit.quit(),
     });

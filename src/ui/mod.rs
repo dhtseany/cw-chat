@@ -6,7 +6,7 @@ use adw::prelude::*;
 use cw_chat::{
     audio::engine::{self, Command, Engine, Event},
     morse::encoder,
-    rx::decoder::{RxEvent, Status},
+    rx::decoder::{OverInfo, RxEvent, Status},
 };
 use gtk::{gdk, gio, glib};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
@@ -17,6 +17,9 @@ const CSS: &str = "
 .bubble { padding: 8px 12px; border-radius: 12px; }
 .bubble.tx { background-color: alpha(@accent_bg_color, 0.18); }
 .bubble.rx { background-color: alpha(@view_fg_color, 0.07); }
+.bubble.rx.station-1 { background-color: alpha(@success_bg_color, 0.2); }
+.bubble.rx.station-2 { background-color: alpha(@warning_bg_color, 0.2); }
+.bubble.rx.station-3 { background-color: alpha(@error_bg_color, 0.16); }
 .bubble .message { font-size: 1.15em; }
 .keyed { color: @success_color; }
 .idle-key { color: alpha(@view_fg_color, 0.25); }
@@ -39,6 +42,9 @@ pub fn run(engine: EngineArgs, tone: ToneArgs) -> Result<(), Box<dyn std::error:
             );
         }
         app.set_accels_for_action("window.close", &["<Ctrl>q", "<Ctrl>w"]);
+        app.set_accels_for_action("win.copy-all", &["<Ctrl><Shift>c"]);
+        app.set_accels_for_action("win.clear", &["<Ctrl>l"]);
+        app.set_accels_for_action("win.new-line", &["<Ctrl>Return"]);
     });
     app.connect_activate(move |app| build(app, engine.clone(), tone.clone()));
     // Our options were parsed by clap; GTK gets none.
@@ -55,9 +61,13 @@ struct TxRow {
 }
 
 struct RxRow {
+    bubble: gtk::Box,
     header: gtk::Label,
     text: gtk::Label,
     content: String,
+    time: String,
+    /// The sender's speed has been added to the header.
+    has_wpm: bool,
 }
 
 struct State {
@@ -66,6 +76,8 @@ struct State {
     next_id: u64,
     tx_rows: HashMap<u64, TxRow>,
     rx_row: Option<RxRow>,
+    /// The over being received: who is sending, for the bubble header.
+    rx_over: Option<OverInfo>,
     rx_wpm: f64,
     pending: usize,
 }
@@ -81,6 +93,12 @@ struct Ui {
     level: gtk::LevelBar,
     key: gtk::Label,
     rx_info: gtk::Label,
+    tone: gtk::Scale,
+    tone_label: gtk::Label,
+    auto: gtk::ToggleButton,
+    /// Set while the window moves the tone controls itself, so their handlers
+    /// do not treat it as the user taking over.
+    syncing: Rc<std::cell::Cell<bool>>,
     toasts: adw::ToastOverlay,
     banner: adw::Banner,
 }
@@ -116,8 +134,12 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         .icon_name("audio-input-microphone-symbolic")
         .title("No messages yet")
         .description(format!(
-            "Type below to send CW. Received CW appears here as it is decoded.\nRX listens at {} Hz.",
-            config.rx_tone
+            "Type below to send CW. Received CW appears here as it is decoded.\n{}",
+            if config.rx_auto {
+                "The RX tone follows the signal automatically.".to_owned()
+            } else {
+                format!("RX listens at {:.0} Hz.", config.rx_tone)
+            }
         ))
         .vexpand(true)
         .build();
@@ -140,8 +162,9 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         level.remove_offset_value(Some(offset));
     }
     let rx_info = gtk::Label::builder()
-        .label(format!("RX {:.0} Hz", config.rx_tone))
+        .label(format!("{:.0} Hz", config.rx_tone))
         .css_classes(["caption", "dim-label", "numeric"])
+        .selectable(true)
         .width_chars(18)
         .xalign(1.0)
         .build();
@@ -163,10 +186,55 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
             .css_classes(["caption-heading"])
             .build(),
     );
+    let new_line = gtk::Button::builder()
+        .label("New line")
+        .css_classes(["flat"])
+        .tooltip_text("Start a new RX line now (Ctrl+Enter)")
+        .build();
     meter.append(&key);
     meter.append(&level);
     meter.append(&rx_info);
+    meter.append(&new_line);
     meter.append(&stop);
+
+    // RX tone row: live slider plus automatic tracking.
+    let tone_scale = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        cw_chat::rx::tuner::MIN_HZ,
+        cw_chat::rx::tuner::MAX_HZ,
+        5.0,
+    );
+    tone_scale.set_value(config.rx_tone);
+    tone_scale.set_hexpand(true);
+    tone_scale.set_tooltip_text(Some(
+        "Audio pitch the decoder listens for; dragging switches to manual",
+    ));
+    let tone_label = gtk::Label::builder()
+        .label(format!("{:.0} Hz", config.rx_tone))
+        .css_classes(["numeric"])
+        .selectable(true)
+        .width_chars(8)
+        .xalign(1.0)
+        .build();
+    let auto = gtk::ToggleButton::builder()
+        .label("Auto")
+        .active(config.rx_auto)
+        .tooltip_text("Follow the strongest CW signal between 300 and 1200 Hz")
+        .build();
+    let tone_row = gtk::Box::builder()
+        .spacing(8)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    tone_row.append(
+        &gtk::Label::builder()
+            .label("Tone")
+            .css_classes(["caption-heading"])
+            .build(),
+    );
+    tone_row.append(&tone_scale);
+    tone_row.append(&tone_label);
+    tone_row.append(&auto);
 
     // Input row.
     let entry = gtk::Entry::builder()
@@ -196,6 +264,7 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
     content.append(&scroller);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&meter);
+    content.append(&tone_row);
     content.append(&input);
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&content));
@@ -210,6 +279,10 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         level,
         key,
         rx_info,
+        tone: tone_scale.clone(),
+        tone_label,
+        auto: auto.clone(),
+        syncing: Rc::new(std::cell::Cell::new(false)),
         toasts: toasts.clone(),
         banner,
     };
@@ -231,6 +304,7 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         next_id: 0,
         tx_rows: HashMap::new(),
         rx_row: None,
+        rx_over: None,
         rx_wpm: tone.wpm,
         pending: 0,
     }));
@@ -246,7 +320,12 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
     // Header bar and settings.
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&window_title));
-    header.pack_end(&settings_button(&state, &config, &ui));
+    let clear = gtk::Button::builder()
+        .icon_name("edit-clear-all-symbolic")
+        .tooltip_text("Clear the transcript (Ctrl+L)")
+        .build();
+    header.pack_start(&clear);
+    header.pack_end(&settings_button(&state, &config));
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&toasts));
@@ -278,15 +357,69 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
         let state = state.clone();
         move |_| abort(&state)
     });
+    tone_scale.connect_value_changed({
+        let (ui, state) = (ui.clone(), state.clone());
+        move |scale| {
+            ui.tone_label.set_label(&format!("{:.0} Hz", scale.value()));
+            if ui.syncing.get() {
+                return;
+            }
+            // The user took over: fixed tone from here on.
+            if ui.auto.is_active() {
+                ui.syncing.set(true);
+                ui.auto.set_active(false);
+                ui.syncing.set(false);
+                command(&state, Command::SetRxAuto(false));
+            }
+            command(&state, Command::SetRxTone(scale.value()));
+        }
+    });
+    auto.connect_toggled({
+        let (ui, state) = (ui.clone(), state.clone());
+        move |auto| {
+            if ui.syncing.get() {
+                return;
+            }
+            command(&state, Command::SetRxAuto(auto.is_active()));
+            if !auto.is_active() {
+                command(&state, Command::SetRxTone(ui.tone.value()));
+            }
+        }
+    });
+    new_line.set_action_name(Some("win.new-line"));
+    clear.set_action_name(Some("win.clear"));
+    add_action(&window, "new-line", {
+        let state = state.clone();
+        move || close_rx(&mut state.borrow_mut())
+    });
+    add_action(&window, "clear", {
+        let (ui, state) = (ui.clone(), state.clone());
+        move || clear_transcript(&ui, &state)
+    });
+    add_action(&window, "copy-all", {
+        let ui = ui.clone();
+        move || copy(&ui, &transcript_text(&ui))
+    });
+    for area in [
+        ui.scroller.upcast_ref::<gtk::Widget>(),
+        ui.empty.upcast_ref(),
+    ] {
+        area.add_controller(context_menu_gesture());
+    }
+    // Capture phase, so Ctrl+Enter reaches us before the entry treats it as Send.
+    // (Ctrl+L and Ctrl+Shift+C are application accelerators.)
     let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed({
         let state = state.clone();
-        move |_, key, _, _| {
-            if key == gdk::Key::Escape {
-                abort(&state);
-                return glib::Propagation::Stop;
+        move |_, key, _, modifiers| {
+            let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+            match key {
+                gdk::Key::Escape => abort(&state),
+                gdk::Key::Return | gdk::Key::KP_Enter if ctrl => close_rx(&mut state.borrow_mut()),
+                _ => return glib::Propagation::Proceed,
             }
-            glib::Propagation::Proceed
+            glib::Propagation::Stop
         }
     });
     window.add_controller(keys);
@@ -304,11 +437,7 @@ fn build(app: &adw::Application, engine_args: EngineArgs, tone: ToneArgs) {
     entry.grab_focus();
 }
 
-fn settings_button(
-    state: &Rc<RefCell<State>>,
-    config: &engine::Config,
-    ui: &Ui,
-) -> gtk::MenuButton {
+fn settings_button(state: &Rc<RefCell<State>>, config: &engine::Config) -> gtk::MenuButton {
     let grid = gtk::Grid::builder()
         .row_spacing(8)
         .column_spacing(12)
@@ -336,8 +465,6 @@ fn settings_button(
     gain.set_hexpand(true);
     gain.set_draw_value(true);
     gain.set_digits(2);
-    let rx = gtk::SpinButton::with_range(300.0, 1500.0, 10.0);
-    rx.set_value(config.rx_tone);
     let mute = gtk::Switch::builder()
         .active(config.rx_mute)
         .halign(gtk::Align::Start)
@@ -351,10 +478,8 @@ fn settings_button(
     grid.attach(&label("Gain"), 0, 3, 1, 1);
     grid.attach(&gain, 1, 3, 1, 1);
     grid.attach(&heading("Receive"), 0, 4, 2, 1);
-    grid.attach(&label("Tone (Hz)"), 0, 5, 1, 1);
-    grid.attach(&rx, 1, 5, 1, 1);
-    grid.attach(&label("Mute while sending"), 0, 6, 1, 1);
-    grid.attach(&mute, 1, 6, 1, 1);
+    grid.attach(&label("Mute while sending"), 0, 5, 1, 1);
+    grid.attach(&mute, 1, 5, 1, 1);
 
     wpm.connect_value_changed({
         let state = state.clone();
@@ -367,13 +492,6 @@ fn settings_button(
     gain.connect_value_changed({
         let state = state.clone();
         move |scale| state.borrow_mut().tone.gain = scale.value()
-    });
-    rx.connect_value_changed({
-        let (state, ui) = (state.clone(), ui.clone());
-        move |spin| {
-            command(&state, Command::SetRxTone(spin.value()));
-            ui.rx_info.set_label(&format!("RX {:.0} Hz", spin.value()));
-        }
     });
     mute.connect_active_notify({
         let state = state.clone();
@@ -436,7 +554,7 @@ fn send_message(ui: &Ui, state: &Rc<RefCell<State>>) {
     st.next_id += 1;
     let id = st.next_id;
     let details = format!("{} WPM · {:.0} Hz", st.tone.wpm, st.tone.tone);
-    let (bubble, _, _) = bubble(true, &format!("TX · {} · {details}", now()), &text);
+    let (bubble, _, _) = bubble(ui, true, &format!("TX · {} · {details}", now()), &text);
     let morse = gtk::Label::builder()
         .label(message.to_string())
         .xalign(0.0)
@@ -448,8 +566,12 @@ fn send_message(ui: &Ui, state: &Rc<RefCell<State>>) {
     let status = gtk::Label::builder()
         .label("Queued")
         .xalign(1.0)
+        .selectable(true)
         .css_classes(["caption", "dim-label"])
         .build();
+    for label in [&morse, &status] {
+        label.set_extra_menu(Some(&context_menu(true)));
+    }
     bubble.append(&morse);
     bubble.append(&progress);
     bubble.append(&status);
@@ -488,27 +610,55 @@ fn handle_event(ui: &Ui, state: &Rc<RefCell<State>>, event: Event) {
             ui.stop.set_visible(st.pending > 0);
         }
         Event::Rx(RxEvent::Idle) => close_rx(&mut st),
+        Event::Rx(RxEvent::Over(info)) => {
+            close_rx(&mut st);
+            st.rx_over = Some(info);
+        }
+        Event::Rx(RxEvent::OverUpdate(info)) => {
+            let previous = st.rx_over.replace(info);
+            let wpm = st.rx_wpm;
+            if let Some(row) = &st.rx_row {
+                if let Some(previous) = previous {
+                    row.bubble
+                        .remove_css_class(&format!("station-{}", previous.station % 4));
+                }
+                row.bubble
+                    .add_css_class(&format!("station-{}", info.station % 4));
+                row.header
+                    .set_label(&rx_title(Some(info), &row.time, row.has_wpm.then_some(wpm)));
+            }
+        }
+        // A word gap right after a forced new line would only add a leading space.
+        Event::Rx(RxEvent::WordGap) if st.rx_row.is_none() => {}
         Event::Rx(event) => {
             if st.rx_row.is_none() {
-                let (bubble, header, text) = bubble(false, &format!("RX · {}", now()), "");
+                let time = now();
+                let title = rx_title(st.rx_over, &time, None);
+                let (bubble, header, text) = bubble(ui, false, &title, "");
+                if let Some(over) = st.rx_over {
+                    bubble.add_css_class(&format!("station-{}", over.station % 4));
+                }
                 append(ui, &bubble);
                 st.rx_row = Some(RxRow {
+                    bubble,
                     header,
                     text,
                     content: String::new(),
+                    time,
+                    has_wpm: false,
                 });
             }
-            let wpm = st.rx_wpm;
+            let (wpm, over) = (st.rx_wpm, st.rx_over);
             let row = st.rx_row.as_mut().unwrap();
             match event {
                 RxEvent::Char(c) => row.content.push(c),
                 RxEvent::WordGap => row.content.push(' '),
-                RxEvent::Idle => unreachable!(),
+                RxEvent::Idle | RxEvent::Over(_) | RxEvent::OverUpdate(_) => unreachable!(),
             }
             row.text.set_label(&row.content);
-            if !row.header.label().contains("WPM") {
-                row.header
-                    .set_label(&format!("{} · ~{wpm:.0} WPM", row.header.label()));
+            if !row.has_wpm {
+                row.has_wpm = true;
+                row.header.set_label(&rx_title(over, &row.time, Some(wpm)));
             }
             scroll_to_end(ui);
         }
@@ -537,10 +687,16 @@ fn show_status(ui: &Ui, st: &mut State, status: Status) {
         ui.key.set_css_classes(&["idle-key"]);
     }
     st.rx_wpm = status.wpm;
-    let tone = ui.rx_info.label();
-    let tone = tone.split(" · ").next().unwrap_or("RX").to_owned();
-    ui.rx_info
-        .set_label(&format!("{tone} · {:.0} WPM", status.wpm));
+    let label = format!("{:.0} Hz · {:.0} WPM", status.tone, status.wpm);
+    if ui.rx_info.label() != label {
+        ui.rx_info.set_label(&label);
+    }
+    // In auto mode the slider shows where the decoder has tuned.
+    if status.auto && (ui.tone.value() - status.tone).abs() >= 1.0 {
+        ui.syncing.set(true);
+        ui.tone.set_value(status.tone);
+        ui.syncing.set(false);
+    }
 }
 
 /// Finish the current RX over, trimming the trailing word gap.
@@ -550,10 +706,46 @@ fn close_rx(st: &mut State) {
     }
 }
 
+/// Remove every message; sending and decoding carry on, and later text starts fresh.
+fn clear_transcript(ui: &Ui, state: &Rc<RefCell<State>>) {
+    close_rx(&mut state.borrow_mut());
+    while let Some(child) = ui.transcript.first_child() {
+        ui.transcript.remove(&child);
+    }
+    ui.scroller.set_visible(false);
+    ui.empty.set_visible(true);
+}
+
 fn show_banner(ui: &Ui, message: &str) {
     ui.banner.set_title(message);
     ui.banner.set_revealed(true);
     ui.send.set_sensitive(false);
+}
+
+/// Header for an RX bubble: station, time, pitch, level, then speed once known.
+fn rx_title(over: Option<OverInfo>, time: &str, wpm: Option<f64>) -> String {
+    let mut title = match over {
+        Some(over) => format!(
+            "RX · Station {} · {time} · {:.0} Hz · {:.0} dBFS",
+            station_letter(over.station),
+            over.pitch_hz,
+            over.level_db
+        ),
+        None => format!("RX · {time}"),
+    };
+    if let Some(wpm) = wpm {
+        title.push_str(&format!(" · ~{wpm:.0} WPM"));
+    }
+    title
+}
+
+/// Stations are lettered in the order they are first heard: A, B, ... Z, A2, ...
+fn station_letter(station: usize) -> String {
+    let letter = (b'A' + (station % 26) as u8) as char;
+    match station / 26 {
+        0 => letter.to_string(),
+        round => format!("{letter}{}", round + 1),
+    }
 }
 
 fn now() -> String {
@@ -563,8 +755,9 @@ fn now() -> String {
         .unwrap_or_default()
 }
 
-/// A message bubble: sent overs on the right, received on the left.
-fn bubble(tx: bool, header: &str, text: &str) -> (gtk::Box, gtk::Label, gtk::Label) {
+/// A message bubble: sent overs on the right, received on the left. Every label is
+/// selectable and its context menu adds Copy Message, Copy All, New Line, and Clear.
+fn bubble(ui: &Ui, tx: bool, header: &str, text: &str) -> (gtk::Box, gtk::Label, gtk::Label) {
     let bubble = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
@@ -578,6 +771,7 @@ fn bubble(tx: bool, header: &str, text: &str) -> (gtk::Box, gtk::Label, gtk::Lab
     let header = gtk::Label::builder()
         .label(header)
         .xalign(0.0)
+        .selectable(true)
         .css_classes(["caption", "dim-label"])
         .build();
     let text = gtk::Label::builder()
@@ -589,9 +783,135 @@ fn bubble(tx: bool, header: &str, text: &str) -> (gtk::Box, gtk::Label, gtk::Lab
         .max_width_chars(60)
         .css_classes(["message"])
         .build();
+    for label in [&header, &text] {
+        label.set_extra_menu(Some(&context_menu(true)));
+    }
     bubble.append(&header);
     bubble.append(&text);
+    // "msg.copy" resolves through the widget tree, so it copies this bubble.
+    let actions = gio::SimpleActionGroup::new();
+    let copy_message = gio::SimpleAction::new("copy", None);
+    copy_message.connect_activate({
+        let (ui, bubble) = (ui.clone(), bubble.downgrade());
+        move |_, _| {
+            if let Some(bubble) = bubble.upgrade() {
+                copy(&ui, &bubble_text(&bubble));
+            }
+        }
+    });
+    actions.add_action(&copy_message);
+    bubble.insert_action_group("msg", Some(&actions));
     (bubble, header, text)
+}
+
+fn add_action(window: &adw::ApplicationWindow, name: &str, activate: impl Fn() + 'static) {
+    let action = gio::SimpleAction::new(name, None);
+    action.connect_activate(move |_, _| activate());
+    window.add_action(&action);
+}
+
+/// Items for the transcript context menu; Copy Message only applies over a bubble.
+fn context_menu(message: bool) -> gio::Menu {
+    let copy = gio::Menu::new();
+    if message {
+        copy.append(Some("Copy Message"), Some("msg.copy"));
+    }
+    copy.append(Some("Copy All"), Some("win.copy-all"));
+    let edit = gio::Menu::new();
+    edit.append(Some("New Line"), Some("win.new-line"));
+    edit.append(Some("Clear"), Some("win.clear"));
+    let menu = gio::Menu::new();
+    menu.append_section(None, &copy);
+    menu.append_section(None, &edit);
+    menu
+}
+
+/// Right-click outside any label: selectable labels show their own menu (with our
+/// items appended), so this covers bubble backgrounds and empty space.
+fn context_menu_gesture() -> gtk::GestureClick {
+    let gesture = gtk::GestureClick::builder()
+        .button(gdk::BUTTON_SECONDARY)
+        .build();
+    gesture.connect_pressed(|gesture, _, x, y| {
+        let Some(area) = gesture.widget() else {
+            return;
+        };
+        let picked = area.pick(x, y, gtk::PickFlags::DEFAULT);
+        let mut bubble = None;
+        let mut widget = picked;
+        while let Some(current) = widget {
+            if current.is::<gtk::Label>() {
+                return;
+            }
+            if current.has_css_class("bubble") {
+                bubble = Some(current);
+                break;
+            }
+            if current == area {
+                break;
+            }
+            widget = current.parent();
+        }
+        let parent = bubble.clone().unwrap_or_else(|| area.clone());
+        let popover = gtk::PopoverMenu::from_model(Some(&context_menu(bubble.is_some())));
+        popover.set_parent(&parent);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+        let point = area
+            .compute_point(&parent, &gtk::graphene::Point::new(x as f32, y as f32))
+            .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(
+            point.x() as i32,
+            point.y() as i32,
+            1,
+            1,
+        )));
+        popover.connect_closed(|popover| {
+            // Unparent after the close animation has let go of the popover.
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        popover.popup();
+    });
+    gesture
+}
+
+/// A bubble's visible labels, one per line: header, text, Morse, status.
+fn bubble_text(bubble: &gtk::Box) -> String {
+    let mut lines = Vec::new();
+    let mut child = bubble.first_child();
+    while let Some(widget) = child {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            let text = label.text();
+            if widget.is_visible() && !text.is_empty() {
+                lines.push(text.to_string());
+            }
+        }
+        child = widget.next_sibling();
+    }
+    lines.join("\n")
+}
+
+fn transcript_text(ui: &Ui) -> String {
+    let mut messages = Vec::new();
+    let mut child = ui.transcript.first_child();
+    while let Some(widget) = child {
+        if let Some(bubble) = widget.downcast_ref::<gtk::Box>() {
+            messages.push(bubble_text(bubble));
+        }
+        child = widget.next_sibling();
+    }
+    messages.join("\n\n")
+}
+
+fn copy(ui: &Ui, text: &str) {
+    if text.is_empty() {
+        ui.toasts.add_toast(adw::Toast::new("Nothing to copy"));
+        return;
+    }
+    ui.transcript.clipboard().set_text(text);
+    ui.toasts.add_toast(adw::Toast::new("Copied to clipboard"));
 }
 
 fn append(ui: &Ui, widget: &impl IsA<gtk::Widget>) {
